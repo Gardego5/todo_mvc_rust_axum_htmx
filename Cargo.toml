@@ -8,5 +8,10 @@ edition = "2021"
 [dependencies]
 axum = "0.7.5"
 maud = { version = "0.26.0", features = ["axum"] }
-surrealdb = "1.4.0"
+rand = "0.8.5"
+serde = { version = "1.0.197", features = ["derive"] }
+surrealdb = { version = "1.4.0", features = ["kv-mem"] }
 tokio = "1.37.0"
+tower = "0.4.13"
+tower-sessions = "0.12.1"
+tower-sessions-surrealdb-store = "0.4.0"
