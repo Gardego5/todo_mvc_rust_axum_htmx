@@ -1,6 +1,7 @@
 use axum::{
+    extract::Path,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Form, Router,
 };
 use maud::{html, Markup, PreEscaped, Render, DOCTYPE};
@@ -12,7 +13,6 @@ use tower_sessions::{
 use tower_sessions_surrealdb_store::SurrealSessionStore;
 
 const STYLESHEET: &str = include_str!("style.css");
-const STATE_KEY: &str = "state";
 
 #[tokio::main]
 async fn main() {
@@ -54,15 +54,27 @@ async fn main() {
 #[derive(Default, Deserialize, Serialize)]
 struct State {
     todos: Vec<Todo>,
-    footer: Footer,
+    filter: Filter,
+}
+
+impl State {
+    const KEY: &'static str = "state";
+
+    async fn read(session: Session) -> Self {
+        session
+            .get(Self::KEY)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default()
+    }
+
+    async fn write(&self, session: Session) {
+        session.insert(Self::KEY, self).await.unwrap();
+    }
 }
 
 async fn handler(session: Session) -> impl IntoResponse {
-    let state: State = session
-        .get(STATE_KEY)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let state = State::read(session).await;
 
     html! { (DOCTYPE) html lang="en" data-framework="axum-htmx-maud" {
         head {
@@ -85,18 +97,14 @@ async fn handler(session: Session) -> impl IntoResponse {
                 header.header {
                     h1 { "todos" }
                     input.new-todo
-                        placeholder="What needs to be done?"
-                        hx-post="/todo"
-                        hx-target="input[name='next-todo']"
-                        hx-swap="outerHTML"
-                        name="todo"
-                        hx-include="input[name='next-todo']"
-                        autofocus { }
+                        hx-post="/todo" hx-target="input[name='next-todo']" hx-include="input[name='next-todo']" hx-swap="outerHTML"
+                        x-data "@htmx:after-request.camel"="$event.detail.successful && ($event.target.value = '')"
+                        placeholder="What needs to be done?" name="todo" autofocus;
                 }
 
-                (Todos(state.todos))
+                (List::from(&state))
 
-                (state.footer)
+                (Footer::from(&state))
             }
 
             footer.info {
@@ -116,10 +124,11 @@ enum TodoPlaceholder {
 
 impl Render for TodoPlaceholder {
     fn render(&self) -> Markup {
-        html! { input type="hidden" name="next-todo" value=(match self {
-            TodoPlaceholder::Extend => "Extend",
-            TodoPlaceholder::FullPayload => "FullPayload",
-        }) { } }
+        html! { @match self {
+            TodoPlaceholder::Extend => input type="hidden" name="next-todo" value="Extend";,
+            TodoPlaceholder::FullPayload => input #todo-list hx-swap-oob="true"
+                type="hidden" name="next-todo" value="FullPayload";
+        } }
     }
 }
 
@@ -130,21 +139,43 @@ struct Todo {
     id: u64,
 }
 
-struct Todos(Vec<Todo>);
+struct List<'a> {
+    todos: Vec<&'a Todo>,
+    all_completed: bool,
+    oob: bool,
+}
 
-impl Render for Todos {
+impl<'a, 'b> From<&'a State> for List<'b>
+where
+    'a: 'b,
+{
+    fn from(state: &'a State) -> Self {
+        List {
+            oob: true,
+            all_completed: state.todos.iter().all(|todo| todo.completed),
+            todos: match state.filter {
+                Filter::All => state.todos.iter().collect(),
+                Filter::Active => state.todos.iter().filter(|todo| !todo.completed).collect(),
+                Filter::Completed => state.todos.iter().filter(|todo| todo.completed).collect(),
+            },
+        }
+    }
+}
+
+impl Render for List<'_> {
     fn render(&self) -> Markup {
-        html! { @if self.0.is_empty() {
+        html! { @if self.todos.is_empty() {
             (TodoPlaceholder::FullPayload)
         } @else {
-            main.main {
+            main.main #todo-list hx-swap-oob=[self.oob.then(|| "true")] {
                 div.toggle-all-container {
-                    input.toggle-all #toggle-all type="checkbox" { }
+                    input.toggle-all #toggle-all type="checkbox" checked=(self.all_completed)
+                        hx-post="/toggle-todos";
                     label for="toggle-all" { "Mark all as complete" }
                 }
 
                 ul.todo-list {
-                    @for item in &self.0 { (item) }
+                    @for todo in &self.todos { (todo) }
                     (TodoPlaceholder::Extend)
                 }
             }
@@ -158,45 +189,80 @@ impl Todo {
         struct NewTodo {
             todo: String,
             #[serde(rename = "next-todo")]
-            todo_placeholder: TodoPlaceholder,
+            placeholder: TodoPlaceholder,
         }
         async fn add_todo(session: Session, Form(new_todo): Form<NewTodo>) -> impl IntoResponse {
-            let todo = Todo {
+            let mut state = State::read(session.clone()).await;
+            state.todos.push(Todo {
                 completed: false,
                 description: new_todo.todo,
                 id: rand::random(),
-            };
-            let mut state: State = session
-                .get(STATE_KEY)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_default();
-            state.todos.push(todo.clone());
-            session.insert(STATE_KEY, state).await.unwrap();
+            });
+            state.write(session).await;
 
-            match new_todo.todo_placeholder {
-                TodoPlaceholder::FullPayload => html! { (Todos(vec![todo])) },
-                TodoPlaceholder::Extend => html! { (todo) (TodoPlaceholder::Extend) },
-            }
+            html! { @match new_todo.placeholder {
+                TodoPlaceholder::FullPayload => (List { oob: false, ..List::from(&state) }) (Footer::from(&state)),
+                TodoPlaceholder::Extend => (state.todos.last().unwrap()) (TodoPlaceholder::Extend),
+            } }
         }
 
         #[derive(Deserialize)]
-        struct TodoId {
+        struct Id {
             id: u64,
         }
-        async fn delete_todo(session: Session, Form(todo_id): Form<TodoId>) -> impl IntoResponse {
-            let mut state: State = session
-                .get(STATE_KEY)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_default();
-            state.todos.retain(|todo| todo.id != todo_id.id);
-            session.insert(STATE_KEY, state).await.unwrap();
+        async fn delete_todo(session: Session, Path(path): Path<Id>) -> impl IntoResponse {
+            let mut state = State::read(session.clone()).await;
+            state.todos.retain(|todo| todo.id != path.id);
+            let footer = Footer::from(&state);
+            state.write(session).await;
+            html! { (footer) }
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct PatchTodo {
+            completed: Option<bool>,
+            desc: Option<String>,
+        }
+        async fn patch_todo(
+            session: Session,
+            Path(path): Path<Id>,
+            Form(body): Form<PatchTodo>,
+        ) -> impl IntoResponse {
+            let mut state = State::read(session.clone()).await;
+
+            if let Some(todo) = state.todos.iter_mut().find(|todo| todo.id == path.id) {
+                if let Some(completed) = body.completed {
+                    todo.completed = !completed; // toggle the value
+                }
+                if let Some(description) = body.desc {
+                    todo.description = description;
+                }
+
+                let result = html! { (todo) (Footer::from(&state)) };
+                state.write(session).await;
+
+                result
+            } else {
+                html! {}
+            }
+        }
+
+        async fn toggle_todos(session: Session) -> impl IntoResponse {
+            let mut state = State::read(session.clone()).await;
+            let all_completed = state.todos.iter().all(|todo| todo.completed);
+            state
+                .todos
+                .iter_mut()
+                .for_each(|todo| todo.completed = !all_completed);
+            state.write(session).await;
+            html! { (List::from(&state)) (Footer::from(&state)) }
         }
 
         Router::new()
             .route("/todo", post(add_todo))
-            .route("/todo", delete(delete_todo))
+            .route("/todo/:id", delete(delete_todo))
+            .route("/todo/:id", patch(patch_todo))
+            .route("/toggle-todos", post(toggle_todos))
     }
 
     fn data(&self) -> String {
@@ -210,19 +276,23 @@ impl Todo {
 impl Render for Todo {
     fn render(&self) -> Markup {
         html! {
-            li.completed[self.completed] #(self.id) x-data=(self.data())
-                x-bind:class=r#"editing && "editing""# x-on:dblclick="editing = !editing" {
+            li.completed[self.completed] #{"todo-" (self.id)} x-data=(self.data())
+                x-bind:class=r#"editing && "editing""#
+                x-on:dblclick="editing = !editing; $nextTick(() => $refs['edit-todo-input'].focus())"
+                hx-swap="outerHTML" hx-target={"#todo-" (self.id)} {
                     div.view x-show="!editing" {
-                        input.toggle type="checkbox" { }
+                        input.toggle type="checkbox" checked[self.completed]
+                            hx-patch={"/todo/" (self.id)} hx-include="next input[name='completed']";
                         label x-text="description" { }
-                        button.destroy hx-delete="/todo" hx-swap="outerHTML" hx-target="closest li" hx-include="next input.destroy-data" { }
-                        input.destroy-data type="hidden" name="id" value=(self.id) { }
+                        button.destroy hx-delete={"/todo/" (self.id)} { }
                     }
+                    input type="hidden" name="completed" value=(self.completed);
 
-                    div.input-container x-show="editing" {
-                        input.edit #edit-todo-input x-model="description" { }
+                    template x-if="editing" { div.input-container {
+                        input.edit #edit-todo-input x-ref="edit-todo-input"
+                            hx-patch={"/todo/" (self.id)} name="desc" x-model="description";
                         label.visually-hidden for="edit-todo-input" { "Edit Todo Input" }
-                    }
+                    } }
                 }
         }
     }
@@ -249,8 +319,9 @@ impl ToString for Filter {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Footer {
     current_filter: Filter,
-    num_active: u16,
-    num_completed: u16,
+    num_active: usize,
+    num_completed: usize,
+    oob: bool,
 }
 
 impl Footer {
@@ -260,46 +331,56 @@ impl Footer {
             filter: Filter,
         }
         async fn select_filter(session: Session, Form(q): Form<SelectForm>) -> impl IntoResponse {
-            let mut state: State = session
-                .get(STATE_KEY)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_default();
-            state.footer.current_filter = q.filter.clone();
-            session.insert(STATE_KEY, state).await.unwrap();
+            let mut state = State::read(session.clone()).await;
+            state.filter = q.filter;
+            state.write(session).await;
 
-            html! { (Footer { current_filter: q.filter, ..Default::default() }) }
+            html! { (List::from(&state)) (Footer { oob: false, ..From::from(&state) }) }
         }
 
-        Router::new().route("/select", post(select_filter))
+        async fn clear_completed(session: Session) -> impl IntoResponse {
+            let mut state = State::read(session.clone()).await;
+            state.todos.retain(|todo| !todo.completed);
+            state.write(session).await;
+
+            html! { (List::from(&state)) (Footer { oob: false, ..From::from(&state) }) }
+        }
+
+        Router::new()
+            .route("/select", post(select_filter))
+            .route("/clear-completed", post(clear_completed))
+    }
+}
+
+impl From<&State> for Footer {
+    fn from(state: &State) -> Self {
+        Self {
+            num_active: state.todos.iter().filter(|todo| !todo.completed).count(),
+            num_completed: state.todos.iter().filter(|todo| todo.completed).count(),
+            current_filter: state.filter.clone(),
+            oob: true,
+        }
     }
 }
 
 impl Render for Footer {
     fn render(&self) -> Markup {
-        html! { footer.footer {
+        html! { footer.footer #footer hx-swap-oob=[self.oob.then(|| "true")]
+            hx-target="footer.footer" hx-swap="outerHTML" {
             span.todo-count {
                 strong { (self.num_active) }
                 " item" @if self.num_active != 1 { "s" } " left"
             }
 
-            ul.filters {
-                @for filter in [Filter::All, Filter::Active, Filter::Completed] {
-                    li {
-                        a.selected[self.current_filter == filter]
-                            hx-post=("/select")
-                            hx-target="footer"
-                            hx-include="find input"
-                            hx-swap="outerHTML" {
-                                input type="hidden" name="filter" value=(filter.to_string()) { }
-                                (filter.to_string())
-                            }
-                    }
-                }
+            ul.filters hx-include="next input" {
+                @for filter in [Filter::All, Filter::Active, Filter::Completed] { li {
+                    a.selected[self.current_filter == filter] hx-post=("/select") { (filter.to_string()) }
+                    input type="hidden" name="filter" value=(filter.to_string());
+                } }
             }
 
             @if self.num_completed > 0 {
-                button.clear-completed { "Clear completed" }
+                button.clear-completed hx-post="/clear-completed" { "Clear completed" }
             }
         } }
     }
